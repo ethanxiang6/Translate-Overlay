@@ -9,7 +9,7 @@ Android app that translates whatever is on your screen and draws the translation
 3. On-device ML Kit translation converts each block. Results are cached, so text you have already seen translates instantly.
 4. A non-touchable, non-focusable overlay window draws the translated text over each block.
 
-A cheap pixel check skips OCR while the screen is unchanged. When content moves, the old boxes hide and the new frame is scanned right away.
+A fast tracker compares every captured frame, works out how far the content scrolled and moves the boxes by the same amount, so they stay on the text while you scroll. Background OCR scans only add text that has just scrolled into view. After a long scroll the boxes are re-aligned with a short refresh.
 
 ## Settings (all in the app)
 
@@ -34,5 +34,6 @@ gradle :app:assembleDebug
 
 ## Notes
 
+- Tracking follows vertical scrolling. Horizontal swipes and page changes clear the boxes and rescan.
 - Text under an existing box that changes while the rest of the screen stays still is not picked up until something else on screen changes.
 - Apps that block screen capture (some banking and video apps) appear black to the overlay, so nothing gets translated there.

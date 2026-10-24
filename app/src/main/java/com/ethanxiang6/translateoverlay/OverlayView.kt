@@ -43,13 +43,21 @@ class OverlayView(context: Context) : View(context) {
         }
     }
 
+    /** Vertical offset applied when drawing, used to follow scrolling without re-fitting text. */
+    private var offsetY = 0f
+
     fun setBoxes(list: List<TextBox>) {
         boxes = list
+        offsetY = 0f
         rebuild()
         invalidate()
     }
 
-    fun currentBoxes(): List<TextBox> = boxes
+    /** Move every box by [dy] screen pixels. Cheap, no text layout work. */
+    fun shift(dy: Float) {
+        offsetY += dy
+        invalidate()
+    }
 
     private fun rebuild() {
         val textColor = if (dark) Color.WHITE else Color.BLACK
@@ -92,6 +100,8 @@ class OverlayView(context: Context) : View(context) {
         val base = if (dark) Color.rgb(16, 20, 28) else Color.rgb(250, 250, 250)
         bg.color = base
         bg.alpha = (opacity * 255).toInt().coerceIn(0, 255)
+        canvas.save()
+        canvas.translate(0f, offsetY)
         for (i in boxes.indices) {
             val b = boxes[i]
             val l = layouts.getOrNull(i) ?: continue
@@ -107,5 +117,6 @@ class OverlayView(context: Context) : View(context) {
             l.draw(canvas)
             canvas.restore()
         }
+        canvas.restore()
     }
 }

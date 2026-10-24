@@ -8,10 +8,12 @@ import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.os.Handler
 import android.os.Looper
+import java.nio.ByteBuffer
 
 /**
- * Mirrors the screen into an ImageReader at a reduced size and hands out the newest frame
- * as a bitmap. The capture runs at most [maxLongSide] pixels on the long edge.
+ * Mirrors the screen into an ImageReader at a reduced size. Every new frame is reduced to a
+ * luma grid (every 4th pixel horizontally, every row) for cheap motion tracking, and the raw
+ * pixels are kept so a full bitmap can be made on demand for OCR.
  */
 class ScreenGrabber(
     private val projection: MediaProjection,
@@ -20,13 +22,32 @@ class ScreenGrabber(
 ) {
     private var reader: ImageReader? = null
     private var display: VirtualDisplay? = null
-    private var bitmap: Bitmap? = null
-    private var last: Bitmap? = null
 
     var width = 0
         private set
     var height = 0
         private set
+
+    /** Luma columns per row, one per 4 pixels. */
+    var cols = 0
+        private set
+
+    var lumaCur = ByteArray(0)
+        private set
+    var lumaPrev = ByteArray(0)
+        private set
+
+    @Volatile var frameCounter = 0L
+        private set
+
+    private var framesSinceResize = 0
+
+    /** True when both [lumaPrev] and [lumaCur] hold real consecutive frames. */
+    val hasPrev: Boolean get() = framesSinceResize >= 2
+
+    private var raw = ByteArray(0)
+    private var rawRowStride = 0
+    private var rawPixelStride = 4
 
     private val stopCallback = object : MediaProjection.Callback() {
         override fun onStop() {
@@ -34,7 +55,6 @@ class ScreenGrabber(
         }
     }
 
-    /** Create or resize the capture for the given real screen size. */
     @Synchronized
     fun ensureSize(screenW: Int, screenH: Int) {
         val scale = minOf(1f, maxLongSide.toFloat() / maxOf(screenW, screenH))
@@ -57,45 +77,75 @@ class ScreenGrabber(
         }
         reader?.close()
         reader = newReader
-        bitmap?.recycle()
-        bitmap = null
         width = w
         height = h
+        cols = (w + 3) / 4
+        lumaCur = ByteArray(h * cols)
+        lumaPrev = ByteArray(h * cols)
+        framesSinceResize = 0
+        raw = ByteArray(0)
+        rawRowStride = 0
     }
 
-    /** Newest frame as a bitmap, or null when no new frame arrived yet. The bitmap is reused. */
+    /** Take the newest frame if there is one. Returns false when nothing new arrived. */
     @Synchronized
-    fun grab(): Bitmap? {
-        val r = reader ?: return null
+    fun grabLuma(): Boolean {
+        val r = reader ?: return false
         val image = try {
             r.acquireLatestImage()
         } catch (e: Exception) {
             null
-        } ?: return null
+        } ?: return false
         try {
             val plane = image.planes[0]
-            val rowPixels = plane.rowStride / plane.pixelStride
-            var bmp = bitmap
-            if (bmp == null || bmp.width != rowPixels || bmp.height != image.height) {
-                bmp?.recycle()
-                bmp = Bitmap.createBitmap(rowPixels, image.height, Bitmap.Config.ARGB_8888)
-                bitmap = bmp
+            val buf = plane.buffer
+            val rs = plane.rowStride
+            val ps = plane.pixelStride
+            val h = image.height
+
+            val t = lumaPrev
+            lumaPrev = lumaCur
+            lumaCur = t
+            val step = 4 * ps
+            for (y in 0 until h) {
+                val base = y * rs
+                val out = y * cols
+                for (c in 0 until cols) {
+                    val i = base + c * step
+                    val rr = buf.get(i).toInt() and 0xFF
+                    val gg = buf.get(i + 1).toInt() and 0xFF
+                    val bb = buf.get(i + 2).toInt() and 0xFF
+                    lumaCur[out + c] = ((rr + 2 * gg + bb) shr 2).toByte()
+                }
             }
-            plane.buffer.rewind()
-            bmp!!.copyPixelsFromBuffer(plane.buffer)
-            // The bitmap can be wider than the screen because of row padding, crop logically.
-            val out = if (rowPixels == image.width) bmp
-            else Bitmap.createBitmap(bmp, 0, 0, image.width, image.height)
-            last = out
-            return out
+
+            val need = rs * h
+            if (raw.size < need) raw = ByteArray(need)
+            buf.rewind()
+            buf.get(raw, 0, minOf(buf.remaining(), need))
+            rawRowStride = rs
+            rawPixelStride = ps
+
+            framesSinceResize++
+            frameCounter++
+            return true
         } finally {
             image.close()
         }
     }
 
-    /** The most recent frame returned by [grab], used to rescan a screen that hasn't changed. */
+    /** A fresh bitmap of the latest frame for OCR. The caller recycles it. */
     @Synchronized
-    fun peek(): Bitmap? = last?.takeIf { !it.isRecycled }
+    fun snapshot(): Bitmap? {
+        if (rawRowStride == 0 || width == 0) return null
+        val rowPixels = rawRowStride / rawPixelStride
+        val full = Bitmap.createBitmap(rowPixels, height, Bitmap.Config.ARGB_8888)
+        full.copyPixelsFromBuffer(ByteBuffer.wrap(raw, 0, rawRowStride * height))
+        if (rowPixels == width) return full
+        val cropped = Bitmap.createBitmap(full, 0, 0, width, height)
+        if (cropped !== full) full.recycle()
+        return cropped
+    }
 
     @Synchronized
     fun release() {
@@ -107,8 +157,6 @@ class ScreenGrabber(
         display = null
         reader?.close()
         reader = null
-        bitmap?.recycle()
-        bitmap = null
         width = 0
         height = 0
     }

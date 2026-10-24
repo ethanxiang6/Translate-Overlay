@@ -9,26 +9,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
-import android.graphics.RectF
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
-import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.WindowManager
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 class OverlayService : Service() {
 
@@ -41,8 +28,8 @@ class OverlayService : Service() {
         private const val NOTIF_ID = 1
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private var job: Job? = null
+    private var pipeline: Pipeline? = null
+    private var started = false
 
     private lateinit var wm: WindowManager
     private lateinit var prefs: Prefs
@@ -63,7 +50,7 @@ class OverlayService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (intent?.action != ACTION_START || job != null) return START_NOT_STICKY
+        if (intent?.action != ACTION_START || started) return START_NOT_STICKY
 
         startAsForeground()
 
@@ -93,7 +80,15 @@ class OverlayService : Service() {
 
         addOverlay()
         RunState.set(true)
-        job = scope.launch { runLoop() }
+        val view = overlay!!
+        val p = Pipeline(
+            this, grabber!!, view, prefs, translator, ocr,
+            realSize = { realSize() },
+            origin = { originX to originY },
+        )
+        pipeline = p
+        p.start()
+        started = true
         return START_NOT_STICKY
     }
 
@@ -160,167 +155,10 @@ class OverlayService : Service() {
         return dm.widthPixels to dm.heightPixels
     }
 
-    // ---- scan loop ----
-
-    private class Shown(val boxes: List<TextBox>, val capRects: List<RectF>)
-
-    private suspend fun runLoop() {
-        val g = grabber ?: return
-        var baseline: IntArray? = null
-        var shown = Shown(emptyList(), emptyList())
-        var settle = false
-        var lastSettings = ""
-        var lastScreen = 0 to 0
-        var lastRetry = 0L
-
-        while (scope.isActive) {
-            val t0 = SystemClock.uptimeMillis()
-            val sps = prefs.scansPerSecond.coerceIn(1, 15)
-            val interval = 1000L / sps
-
-            val (sw, sh) = realSize()
-            val screenChanged = (sw to sh) != lastScreen
-            lastScreen = sw to sh
-            g.ensureSize(sw, sh)
-
-            val settings = "${prefs.sourceLang}|${prefs.targetLang}|${prefs.ocrScript}|${prefs.minTextDp}"
-            val settingsChanged = settings != lastSettings
-            lastSettings = settings
-
-            if (screenChanged || settingsChanged) {
-                baseline = null
-                settle = false
-                shown = clearBoxes()
-            }
-
-            // A language pack that was downloading may be ready now, rescan the same frame.
-            var retry = false
-            if (shown.boxes.isEmpty() && translator.pending() > 0) {
-                val now = SystemClock.uptimeMillis()
-                if (now - lastRetry > 1000) {
-                    lastRetry = now
-                    retry = true
-                    baseline = null
-                }
-            }
-
-            val frame = g.grab() ?: if (retry || baseline == null) g.peek() else null
-            if (frame != null) {
-                val sig = signature(frame)
-                val base = baseline
-                val changed = base == null ||
-                    changeFraction(base, sig, frame.width, frame.height, shown.capRects) > 0.015f
-
-                if (shown.boxes.isNotEmpty()) {
-                    if (changed) {
-                        // Content moved under the boxes, hide them and rescan on a clean frame.
-                        shown = clearBoxes()
-                        settle = true
-                    }
-                } else if (settle) {
-                    settle = false
-                    delay(70)
-                    val fresh = g.grab() ?: frame
-                    val freshSig = signature(fresh)
-                    shown = scan(fresh, sw, sh, freshSig)
-                    baseline = freshSig
-                } else if (changed) {
-                    shown = scan(frame, sw, sh, sig)
-                    baseline = sig
-                }
-            }
-
-            val spent = SystemClock.uptimeMillis() - t0
-            delay((interval - spent).coerceAtLeast(1))
-        }
-    }
-
-    private suspend fun clearBoxes(): Shown {
-        withContext(Dispatchers.Main) { overlay?.setBoxes(emptyList()) }
-        return Shown(emptyList(), emptyList())
-    }
-
-    private suspend fun scan(frame: android.graphics.Bitmap, sw: Int, sh: Int, sig: IntArray): Shown {
-        val g = grabber ?: return Shown(emptyList(), emptyList())
-        val src = prefs.sourceLang
-        val dst = prefs.targetLang
-        val capScale = g.width.toFloat() / sw
-        val minPx = prefs.minTextDp * resources.displayMetrics.density * capScale
-
-        val blocks = ocr.scan(frame, src, prefs.ocrScript).filter { b ->
-            b.rect.height() >= minPx && b.text.any { it.isLetterOrDigit() } && b.text.length >= 2
-        }
-        if (blocks.isEmpty()) return Shown(emptyList(), emptyList())
-
-        val translated = coroutineScope {
-            blocks.map { b -> async { translator.translate(b.text, src, dst) } }.map { it.await() }
-        }
-
-        val inv = 1f / capScale
-        val boxes = ArrayList<TextBox>()
-        val caps = ArrayList<RectF>()
-        for (i in blocks.indices) {
-            val out = translated[i] ?: continue
-            if (out.isBlank() || out.equals(blocks[i].text, ignoreCase = true)) continue
-            val r = blocks[i].rect
-            val screenRect = RectF(
-                r.left * inv - originX, r.top * inv - originY,
-                r.right * inv - originX, r.bottom * inv - originY,
-            )
-            boxes.add(TextBox(screenRect, blocks[i].text, out))
-            caps.add(RectF(r))
-        }
-
-        withContext(Dispatchers.Main) {
-            overlay?.applyStyle(prefs.boxOpacity, prefs.textScale, prefs.darkBoxes)
-            overlay?.setBoxes(boxes)
-        }
-        return Shown(boxes, caps)
-    }
-
-    // ---- cheap change detection ----
-
-    private val gridX = 48
-    private val gridY = 86
-
-    private fun signature(bmp: android.graphics.Bitmap): IntArray {
-        val out = IntArray(gridX * gridY)
-        for (y in 0 until gridY) {
-            val py = ((y + 0.5f) / gridY * bmp.height).toInt().coerceIn(0, bmp.height - 1)
-            for (x in 0 until gridX) {
-                val px = ((x + 0.5f) / gridX * bmp.width).toInt().coerceIn(0, bmp.width - 1)
-                val c = bmp.getPixel(px, py)
-                val r = (c shr 16) and 0xFF
-                val gr = (c shr 8) and 0xFF
-                val b = c and 0xFF
-                out[y * gridX + x] = (r * 3 + gr * 6 + b) / 10
-            }
-        }
-        return out
-    }
-
-    /** Fraction of grid cells outside the overlay boxes whose brightness changed noticeably. */
-    private fun changeFraction(a: IntArray, b: IntArray, w: Int, h: Int, masks: List<RectF>): Float {
-        var considered = 0
-        var changed = 0
-        val pad = 16f
-        for (y in 0 until gridY) {
-            val cy = (y + 0.5f) / gridY * h
-            for (x in 0 until gridX) {
-                val cx = (x + 0.5f) / gridX * w
-                if (masks.any { cx >= it.left - pad && cx <= it.right + pad && cy >= it.top - pad && cy <= it.bottom + pad }) continue
-                considered++
-                if (kotlin.math.abs(a[y * gridX + x] - b[y * gridX + x]) > 24) changed++
-            }
-        }
-        return if (considered == 0) 0f else changed.toFloat() / considered
-    }
-
     override fun onDestroy() {
         RunState.set(false)
-        job?.cancel()
-        job = null
-        scope.cancel()
+        pipeline?.stop()
+        pipeline = null
         overlay?.let {
             try {
                 wm.removeView(it)
